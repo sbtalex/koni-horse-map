@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Карта коней</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --accent:#b5562f; --ink:#1f1f1f; --muted:#6b6b6b; --line:#e6e1dc; --bg:#faf8f6; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--ink); background:var(--bg); }
+  .wrap { display:flex; flex-direction:column; height:100%; }
+  header { padding:10px 14px; font-weight:600; font-size:15px; border-bottom:1px solid var(--line); background:#fff; }
+  header small { font-weight:400; color:var(--muted); margin-left:6px; }
+  #map { flex:1 1 auto; min-height:320px; }
+  ol { list-style:none; margin:0; padding:6px 14px 10px; max-height:32%; overflow:auto; background:#fff; border-top:1px solid var(--line);
+       display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:2px 16px; }
+  li { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:13px; cursor:pointer; }
+  li:hover .id { text-decoration:underline; }
+  li .city { color:var(--muted); }
+  li.missing { cursor:default; color:var(--muted); }
+  .num { flex:none; width:22px; height:22px; border-radius:50%; background:var(--accent); color:#fff; font-size:11px; font-weight:700;
+         display:inline-flex; align-items:center; justify-content:center; }
+  .missing .num { background:#bbb; }
+  .pin { background:var(--accent); color:#fff; border:2px solid #fff; border-radius:14px; box-shadow:0 1px 4px rgba(0,0,0,.35);
+         font:700 11px/1 system-ui,sans-serif; padding:5px 7px; white-space:nowrap; transform:translate(-50%,-50%); display:inline-block; }
+  .empty { padding:40px 20px; text-align:center; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header id="title">Карта коней</header>
+  <div id="map"></div>
+  <ol id="list"></ol>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/*
+  URL format (built by Make):
+    ?t=<title>&h=<id>~<lat>~<lng>~<city>~<country>|...
+  - With lat/lng the pin is placed directly.
+  - Without lat/lng (<id>~~~<city>~<country>) the city is looked up on the fly (Photon / OpenStreetMap).
+  - Without city too, the horse is only listed, greyed out.
+*/
+(function () {
+  var q = new URLSearchParams(location.search);
+  var title = q.get('t') || 'Карта коней';
+  var raw = q.get('h') || '';
+
+  var CC = { 'голандія':'nl','голландія':'nl','нідерланди':'nl','netherlands':'nl','німеччина':'de','germany':'de',
+    'бельгія':'be','belgium':'be','данія':'dk','denmark':'dk','франція':'fr','france':'fr','польща':'pl','poland':'pl',
+    'австрія':'at','austria':'at','швейцарія':'ch','switzerland':'ch','чехія':'cz','іспанія':'es','spain':'es',
+    'португалія':'pt','італія':'it','italy':'it','швеція':'se','sweden':'se','велика британія':'gb','україна':'ua' };
+
+  var horses = raw.split('|').filter(Boolean).map(function (part, i) {
+    var f = part.split('~');
+    var lat = parseFloat(f[1]), lng = parseFloat(f[2]);
+    var country = (f[4] || '').trim();
+    return { n: i + 1, id: (f[0] || '').trim(), city: (f[3] || '').trim(), country: country,
+             cc: CC[country.toLowerCase()] || '', lat: lat, lng: lng, ok: isFinite(lat) && isFinite(lng) };
+  });
+
+  var map = L.map('map', { scrollWheelZoom: false });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  map.setView([51.5, 7.5], 5); // NL / DE / BE until pins are ready
+
+  setTitle('пошук міст…');
+  geocodeMissing().then(render, render);
+
+  function setTitle(note) {
+    document.getElementById('title').innerHTML = escapeHtml(title) + '<small>' + note + '</small>';
+  }
+
+  function cacheGet(k) { try { return JSON.parse(localStorage.getItem('geo:' + k)); } catch (e) { return null; } }
+  function cacheSet(k, v) { try { localStorage.setItem('geo:' + k, JSON.stringify(v)); } catch (e) {} }
+
+  function geocodeMissing() {
+    var todo = {};
+    horses.forEach(function (h) {
+      if (!h.ok && h.city) (todo[h.cc + '|' + h.city.toLowerCase()] = todo[h.cc + '|' + h.city.toLowerCase()] || []).push(h);
+    });
+    return Promise.all(Object.keys(todo).map(function (key) {
+      var list = todo[key], h0 = list[0];
+      var cached = cacheGet(key);
+      var p = cached ? Promise.resolve(cached) : lookup(h0.city, h0.cc).then(function (r) { if (r) cacheSet(key, r); return r; });
+      return p.then(function (r) {
+        if (r) list.forEach(function (h) { h.lat = r[0]; h.lng = r[1]; h.ok = true; });
+      }, function () {});
+    }));
+  }
+
+  function lookup(city, cc) {
+    var url = 'https://photon.komoot.io/api/?limit=5&lang=en&q=' + encodeURIComponent(city);
+    return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+      var feats = (j.features || []).filter(function (f) {
+        return !cc || (f.properties.countrycode || '').toLowerCase() === cc;
+      });
+      var f = feats[0];
+      return f ? [f.geometry.coordinates[1], f.geometry.coordinates[0]] : null;
+    });
+  }
+
+  function render() {
+    var placed = horses.filter(function (h) { return h.ok; });
+    setTitle(placed.length + ' з ' + horses.length + ' на карті');
+
+    // Horses in the same place share one pin, e.g. "3, 7".
+    var groups = {};
+    placed.forEach(function (h) {
+      var key = h.lat.toFixed(4) + ',' + h.lng.toFixed(4);
+      (groups[key] = groups[key] || []).push(h);
+    });
+
+    var markerByN = {};
+    Object.keys(groups).forEach(function (key) {
+      var g = groups[key];
+      var label = g.map(function (h) { return h.n; }).join(', ');
+      var icon = L.divIcon({ className: '', html: '<span class="pin">' + label + '</span>', iconSize: null });
+      var popup = g.map(function (h) {
+        return '<b>' + h.n + '. ID ' + escapeHtml(h.id) + '</b>' + (h.city ? ' — ' + escapeHtml(h.city) : '');
+      }).join('<br>');
+      var m = L.marker([g[0].lat, g[0].lng], { icon: icon }).addTo(map).bindPopup(popup);
+      g.forEach(function (h) { markerByN[h.n] = m; });
+    });
+
+    if (placed.length) {
+      map.fitBounds(L.latLngBounds(placed.map(function (h) { return [h.lat, h.lng]; })), { padding: [40, 40], maxZoom: 10 });
+    } else if (!horses.length) {
+      document.getElementById('map').insertAdjacentHTML('afterend', '<div class="empty">У посиланні немає коней.</div>');
+    }
+
+    var list = document.getElementById('list');
+    horses.forEach(function (h) {
+      var li = document.createElement('li');
+      if (!h.ok) li.className = 'missing';
+      var place = h.ok ? escapeHtml(h.city) : (h.city ? escapeHtml(h.city) + ' (не знайдено)' : 'немає адреси');
+      li.innerHTML = '<span class="num">' + h.n + '</span><span class="id">ID ' + escapeHtml(h.id) + '</span>' +
+        '<span class="city">' + place + '</span>';
+      if (h.ok) li.onclick = function () {
+        map.setView([h.lat, h.lng], Math.max(map.getZoom(), 9));
+        markerByN[h.n].openPopup();
+      };
+      list.appendChild(li);
+    });
+    if (!horses.length) list.style.display = 'none';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+})();
+</script>
+</body>
+</html>
